@@ -95,3 +95,18 @@ test('询问过去可以取回被更正的旧版本，询问现状只提供当�
   assert.match(store.recallHint(chat, '以前喜欢Coffee吗'), /已被后续信息更正/)
   assert.doesNotMatch(store.recallHint(chat, '现在喜欢Coffee吗'), /以前喜欢Coffee/)
 })
+
+test('大段粘贴不会让旁边的小事实一起超过检索预算，原始长消息仍完整保存', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'aurabot-paste-'))
+  const archive = createConversationArchive({ directory })
+  const chat = 'private:owner', pasted = '无关资料'.repeat(4000)
+  archive.append(chat, { id: 'paste', role: 'user', text: pasted })
+  archive.append(chat, { id: 'fact', role: 'user', text: 'Coffee温控约定用八十八度' })
+  archive.append(chat, { id: 'reply', role: 'assistant', text: '行' })
+  for (let i = 0; i < 40; i++) archive.append(chat, { id: 'filler-' + i, role: 'user', text: '讨论盆栽浇水第' + i + '次' })
+  const recalled = archive.recall(chat, 'Coffee温控约定', { maxCharacters: 900 })
+  assert.match(recalled.text, /八十八度/)
+  assert.ok(recalled.characters <= 900)
+  assert.ok(recalled.selected.some(e => e.context.some(m => m.id === 'fact' && m.role === 'user')))
+  assert.equal(archive.recent(chat, 100).find(m => m.id === 'paste').text, pasted)
+})
