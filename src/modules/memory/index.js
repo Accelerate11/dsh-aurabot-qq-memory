@@ -21,7 +21,7 @@ export default {
     api.on('prompt', (content, info) => {
       try {
         if (!info || !info.chat || info.chat.kind === 'system' || !Array.isArray(content)) return content
-        const hint = memory.recallHint(info.chat, info.queryText || '', info.prevText || '')
+        const hint = memory.recallHint(info.chat, info.queryText || '', info.prevText || '', info.recentMessages || [])
         if (!hint) return content
         return [{ type: 'text', text: hint }, ...content]
       } catch (error) { return content }
@@ -49,7 +49,7 @@ export default {
           properties: { query: str('想找什么') },
           required: ['query'],
           execute: async ({ query }) => {
-            const hits = memory.recall(String(query || ''), { about: chat.userId, limit: 8, where: current + '（翻记忆）' })
+            const hits = memory.recall(String(query || ''), { about: chat.userId, limit: 8, chatId: current, where: current + '（翻记忆）' })
             return hits.length ? { ok: true, message: hits.map((h) => memoryLine(h.it)).join('；') } : { ok: true, message: '没想起相关的事' }
           },
         }),
