@@ -13,6 +13,13 @@
 import { randomUUID } from 'node:crypto'
 import { dataDir, readJson, writeJson } from '../core/store.js'
 import { askModel } from '../core/llm.js'
+import { queriesFor } from '../chat/conversation-context.js'
+
+// New scoped memories stay within their source conversation. Legacy unscoped
+// panel/import entries keep their existing explicitly shared behavior.
+export function visibleInConversation(item, chatId = '') {
+  return !chatId || !item.chatId || item.visibility === 'shared' || item.chatId === chatId
+}
 
 // ---------------- 纯函数：切词与打分 ----------------
 
@@ -63,6 +70,7 @@ export function buildIndex(items) {
  *   about：关于这些人（QQ 号）的记忆加分；群里可以传这一段里所有说话的人
  */
 export function search(idx, query, o = {}) {
+  if (o.chatId) idx = buildIndex(idx.docs.filter(d => visibleInConversation(d.it, o.chatId)).map(d => d.it))
   const q = [...new Set(tokenize(query))]
   const now = o.now ?? Date.now()
   const aboutSet = new Set((Array.isArray(o.about) ? o.about : o.about ? [o.about] : []).map(String))
@@ -70,6 +78,7 @@ export function search(idx, query, o = {}) {
   const b = 0.7
   const scored = []
   for (const d of idx.docs) {
+    if (!visibleInConversation(d.it, o.chatId)) continue
     let s = 0
     const why = []
     for (const t of q) {
@@ -90,7 +99,7 @@ export function search(idx, query, o = {}) {
     scored.push({ it, score, why: why.sort((x, y) => y[1] - x[1]).slice(0, 3).map((w) => w[0]).concat(aboutHit ? ['（关于这个人）'] : []) })
   }
   scored.sort((x, y) => y.score - x.score)
-  return scored.filter((x) => x.score >= (o.minScore ?? 0.35)).slice(0, o.limit ?? 6)
+  return scored.filter((x) => x.score >= (o.minScore ?? (idx.N < 4 ? 0.1 : 0.35))).slice(0, o.limit ?? 6)
 }
 
 /** 「刚才」「3 小时前」「昨天」这样的说法。 */
@@ -119,7 +128,7 @@ export function whenText(at, now = Date.now()) {
 
 /** 想起来的一条记忆怎么写给她：[什么时候] [关于谁] 内容。 */
 export function memoryLine(it, now = Date.now()) {
-  return `[${whenText(it.at, now)}] ` + (it.aboutName ? `[${it.aboutName}] ` : '') + it.text
+  return (it.invalidAt ? '[已被后续信息更正，不能当现状] ' : '') + `[${whenText(it.at, now)}] ` + (it.aboutName ? `[${it.aboutName}] ` : '') + it.text
 }
 
 /**
@@ -188,10 +197,12 @@ export function createMemoryStore({ dsh, getConfig, hub, log }) {
     if (!t) return { ok: false, message: '内容是空的' }
     const s = load()
     // 去重：很像的就更新旧的（时间、重要程度取新），不重复存
-    const dup = s.items.find((m) => !m.invalidAt && similarity(m.text, t) >= 0.6 && (!about || !m.about || m.about === String(about)))
+    // A negation can reverse an otherwise almost identical sentence. Only exact
+    // repeats from the same conversation/subject are safe to merge automatically.
+    const dup = s.items.find((m) => !m.invalidAt && m.text.replace(/\s/g, '') === t.replace(/\s/g, '') && String(m.chatId || '') === String(chatId) && String(m.about || '') === String(about))
     if (dup) {
       dup.text = t.length >= dup.text.length ? t : dup.text
-      dup.at = Date.now()
+      dup.lastObservedAt = Date.now()
       dup.importance = Math.max(Number(dup.importance) || 0, Number(importance) || 0)
       s.rev = (s.rev || 0) + 1
       save(s)
@@ -263,7 +274,7 @@ export function createMemoryStore({ dsh, getConfig, hub, log }) {
     const m = s.items.find((x) => x.id === id)
     const t = String(text || '').trim().slice(0, 200)
     if (!m || !t) return false
-    m.history = [...(m.history || []), { text: m.text, at: m.at }].slice(-3)
+    m.history = [...(m.history || []), { text: m.text, at: m.at }]
     m.text = t
     m.at = Date.now()
     m.importance = Math.max(Number(m.importance) || 0, Number(importance) || 0)
@@ -304,17 +315,20 @@ export function createMemoryStore({ dsh, getConfig, hub, log }) {
   }
 
   const recallLog = [] // 最近几次想起了什么（给面板看）
-  function recall(query, { about, limit, where = '', context = '' } = {}) {
+  function recall(query, { about, limit, where = '', context = '', recentMessages = [], chatId = '', includeInvalid = false } = {}) {
     const max = limit ?? getConfig().memory.recallCount
-    const hits = search(index(), query, { about, limit: max })
+    const queries = queriesFor(query, recentMessages.length ? recentMessages : context ? [{ role: 'user', text: context }] : [])
+    const scope = chatId || (/^(private|group):[^\s:]+$/.test(where) ? where : '')
+    const hits = search(index(), query, { about, limit: max, chatId: scope, includeInvalid })
     // 这一句没想起几条（「嗯嗯」「然后呢」）：用上一句再找找，分数打折
-    if (context && hits.length < max) {
+    if (queries.length > 1) {
       const have = new Set(hits.map((h) => h.it.id))
-      for (const h of search(index(), context, { about, limit: max, minScore: 0.5 })) {
-        if (hits.length >= max) break
-        if (!have.has(h.it.id)) hits.push({ ...h, score: h.score * 0.6, why: [...(h.why || []), '（上一句）'] })
+      for (const cue of queries.slice(1)) for (const h of search(index(), cue, { about, limit: max, minScore: 0.5, chatId: scope, includeInvalid })) {
+        if (!have.has(h.it.id)) { hits.push({ ...h, score: h.score * 0.65, why: [...(h.why || []), ...(context ? ['（上一句）'] : []), '（对话线索）'] }); have.add(h.it.id) }
       }
     }
+    hits.sort((a, b) => b.score - a.score)
+    hits.splice(max)
     recallLog.unshift({ at: Date.now(), where, query: String(query).slice(0, 120), hits: hits.map((h) => ({ id: h.it.id, text: h.it.text, score: Number(h.score.toFixed(2)), why: h.why || [] })) })
     recallLog.length = Math.min(recallLog.length, 20)
     if (hits.length) {
@@ -483,7 +497,7 @@ export function createMemoryStore({ dsh, getConfig, hub, log }) {
    * 这一轮聊到的事相关的记忆（#79）：内容随每条消息变化，所以由模块在「交给她的内容」里附上，
    * 不放进每轮都会追加的运行时上下文快照。最多 4 条、总长 ≤ 300 字。
    */
-  function recallHint(chat, queryText, prevText = '') {
+  function recallHint(chat, queryText, prevText = '', recentMessages = []) {
     const cfg = getConfig().memory
     if (!cfg.enabled) return ''
     const q = String(queryText || '').trim()
@@ -494,11 +508,12 @@ export function createMemoryStore({ dsh, getConfig, hub, log }) {
     const about = chat && chat.kind === 'private' ? chat.userId : undefined
     // 「嗯嗯」「然后呢」这种短句单看检索不到东西，把上一句也带上
     const ctxText = q.length < 12 ? String(prevText || '').slice(-300) : ''
-    const hits = recall(q, { about, where: (chat && chat.chatId) || '', context: ctxText }).filter((h) => !shown.has(h.it.id)).slice(0, 4)
+    const historical = /以前|原来|之前的|当时|那时|曾经|过去|最早|\b(before|previously|used to)\b/i.test(q)
+    const hits = recall(q, { about, where: (chat && chat.chatId) || '', chatId: chat?.chatId || '', context: ctxText, recentMessages, includeInvalid: historical }).filter((h) => !shown.has(h.it.id)).slice(0, 4)
     if (!hits.length) return backdrop
     let body = hits.map((h) => memoryLine(h.it)).join('；')
     if (body.length > 300) body = body.slice(0, 300) + '…'
-    return ['（你记得这些事，方括号里是什么时候的事，聊到相关的就自然用上，别把老事当新事说，也别说「根据记忆」：' + body + '）', backdrop].filter(Boolean).join('\n')
+    return ['（你记得这些事，方括号是获知/记录时间，不保证事件就在那天发生；带“已被更正”的只用于过去，不能当现状。聊到相关的就自然用上，别把老事当新事说，也别说「根据记忆」：' + body + '）', backdrop].filter(Boolean).join('\n')
   }
 
   /** 回顾：结合最近聊天和已有经验，更新这个人的相处经验（合并、提炼、最多 8 条，概括不琐碎）。 */
@@ -567,9 +582,9 @@ export function createMemoryStore({ dsh, getConfig, hub, log }) {
   function relatedTo(chatId, transcript) {
     const ppl = new Set([...String(transcript).matchAll(/\((\d{5,})\)/g)].map((m) => m[1]))
     if (chatId.startsWith('private:')) ppl.add(chatId.slice(8))
-    const items = load().items.filter((m) => !m.invalidAt && m.source !== 'event' && m.source !== 'diary')
+    const items = load().items.filter((m) => !m.invalidAt && visibleInConversation(m, chatId) && m.source !== 'event' && m.source !== 'diary')
     const out = items.filter((m) => m.about && ppl.has(String(m.about))).sort((a, b) => b.at - a.at).slice(0, 10)
-    for (const h of search(index(), String(transcript).slice(-1500), { limit: 8, minScore: 0.5 })) {
+    for (const h of search(index(), String(transcript).slice(-1500), { limit: 8, minScore: 0.5, chatId })) {
       if (out.length >= 15) break
       if (!out.some((m) => m.id === h.it.id) && h.it.source !== 'event' && h.it.source !== 'diary') out.push(h.it)
     }

@@ -30,6 +30,10 @@ function fakePng(w, h, salt = 0) {
 
 // 「模型」脚本
 async function brain({ preset, text, images, callTool }) {
+  // This scripted model dispatches tools by substring. Archived quoted commands
+  // are evidence, not current commands; retain them in turns[].userText for
+  // prompt assertions, but do not dispatch them as new actions in this stub.
+  text = text.split('\n【同一人格、同一聊天的对话资料')[0]
   if (text.includes('at+表情测试')) return '<at:10000001> 看这个<sticker:开心>'
   if (text.includes('热重载探针')) { const r = await callTool('probe73', {}); return r ? '探针:' + r.message : '没有探针工具' }
   if (text.includes('慢工具测试')) { const r = await callTool('slow74', {}); return r ? '慢工具好了' : '没有慢工具' }
@@ -334,6 +338,10 @@ test('群聊一段一回：好几个人连着 @ 她，她看完整段只回一�
   assert.doesNotMatch(api.hub.lastTextOf(sid), /挨个回|引用回复/)
   assert.match(api.hub.lastTextOf(sid), /第一个人说话/)
   assert.deepEqual(api.hub.speakersOf(sid).sort(), ['701', '702', '703', '704'])
+  const archived = api.hub.recentMessagesOf('group:558', 12)
+  for (const [speaker, word] of [['701', '第一个人'], ['702', '第二个人'], ['703', '第三个人'], ['704', '第四个人']]) {
+    assert.ok(archived.some(m => m.role === 'user' && m.speakerId === speaker && m.text.includes(word)), '群聊原话保留实际说话者：' + speaker)
+  }
   const reply = sentTo('group', '558').at(-1).params.message
   assert.ok(!reply.some((seg) => seg.type === 'reply' || seg.type === 'at'), '多个人同时叫她时不猜要引用或 @ 谁')
 })
@@ -1185,6 +1193,10 @@ test('慢工具卡住超过 1.5 秒先发一条「正在做」提示，不让主
   }
   const t = await until(async () => { const x = await turn(); return x.reply === '慢工具好了' ? x : null }, 25000)
   assert.equal(t.reply, '慢工具好了')
+  // Model completion precedes asynchronous bubble delivery. Wait for the actual
+  // final send before checking that the progress notice arrived first.
+  await until(() => mock.calls.slice(before).some(c => c.action === 'send_private_msg'
+    && (c.params.message || []).some(s => s.type === 'text' && /慢工具好了/.test(s.data.text))), 15000)
   const sent = mock.calls.slice(before).filter((c) => c.action === 'send_private_msg').map((c) => c.params.message)
   const texts = sent.map((m) => (m || []).filter((s) => s.type === 'text').map((s) => s.data.text).join(''))
   const noticeAt = texts.findIndex((x) => /还在忙/.test(x))
